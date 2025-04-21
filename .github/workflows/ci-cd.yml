@@ -1,0 +1,191 @@
+name: CI/CD Pipeline Taller DevOps
+
+on:
+  push:
+    branches: [ main ] # Ejecutar en push a main
+  pull_request:
+    branches: [ main ] # Ejecutar en PRs a main (sin despliegue)
+
+jobs:
+  lint:
+    name:  Lint Code
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4 # Usar versión más reciente
+
+      - name: Set up Node.js v18
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: 'npm' # Habilitar caché de npm
+
+      - name: Install Backend Dependencies & Lint
+        run: |
+          cd backend
+          npm ci # Usar ci para instalaciones limpias
+          npm run lint
+
+      - name: Install Frontend Dependencies & Lint
+        run: |
+          cd frontend
+          npm ci
+          npm run lint
+
+  test:
+    name: Run Tests
+    needs: lint
+    runs-on: ubuntu-latest
+    services: # Iniciar un contenedor MongoDB para tests de backend
+      mongo:
+        image: mongo:latest
+        ports: # Mapear puerto por si se necesita acceso directo
+          - 27017:27017
+        options: --health-cmd "mongosh --eval 'db.runCommand(\"ping\").ok'" --health-interval 10s --health-timeout 5s --health-retries 5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js v18
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: 'npm'
+
+      - name: Install Backend Dependencies
+        run: cd backend && npm ci
+
+      - name: Run Backend Tests
+        env:
+          # Usar el servicio 'mongo' iniciado por Actions
+          MONGODB_URI: mongodb://mongo:27017/testDB # El hostname 'mongo' es el nombre del servicio
+          PORT: 5001 # Usar puerto diferente si es necesario
+          NODE_ENV: test
+          CI: true # Variable común para indicar entorno CI
+        run: cd backend && npm test
+
+      - name: Install Frontend Dependencies
+        run: cd frontend && npm ci
+
+      - name: Run Frontend Tests
+        env:
+           CI: true
+        run: cd frontend && npm test -- --coverage # Ejecutar tests (añadir coverage opcional)
+
+  build-and-push:
+    name: Build & Push Docker Images
+    needs: test
+    runs-on: ubuntu-latest
+    # Ejecutar SOLO en push directo a la rama main
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push Backend image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          file: ./backend/Dockerfile
+          push: true
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/taller-devops-backend:latest,${{ secrets.DOCKERHUB_USERNAME }}/taller-devops-backend:${{ github.sha }}
+          cache-from: type=gha # Habilitar caché de Docker en Actions
+          cache-to: type=gha,mode=max
+
+      - name: Build and push Frontend image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile
+          push: true
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/taller-devops-frontend:latest,${{ secrets.DOCKERHUB_USERNAME }}/taller-devops-frontend:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy to Server
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    # Ejecutar SOLO en push directo a la rama main
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout code # Necesitamos el docker-compose.yml (o uno de prod)
+        uses: actions/checkout@v4
+
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            # Navegar al directorio de la aplicación en el servidor
+            export APP_DIR=~/app/taller-devops-final # Define el directorio
+            mkdir -p $APP_DIR
+            cd $APP_DIR
+
+            # Copiar el docker-compose.yml del repo al servidor
+            # (Asumimos que el checkout está disponible en el runner)
+            # Esto requiere configurar `scp` o montar el workspace en el action ssh
+            # Alternativa más simple: Generar el archivo directamente en el servidor
+
+            # Crear/Actualizar el docker-compose.yml en el servidor
+            # (Usa las imágenes de Docker Hub con :latest)
+            echo "version: '3.8'
+            services:
+              frontend:
+                image: ${{ secrets.DOCKERHUB_USERNAME }}/taller-devops-frontend:latest
+                ports:
+                  - '80:80'
+                networks:
+                  - app-network
+                depends_on:
+                  - backend
+              backend:
+                image: ${{ secrets.DOCKERHUB_USERNAME }}/taller-devops-backend:latest
+                environment:
+                  MONGODB_URI: mongodb://mongo:27017/tallerDevopsDBProd # DB de producción
+                  PORT: 5000
+                  NODE_ENV: production
+                  # Aquí podrías inyectar otros secretos si los pasas desde GitHub Secrets
+                  # SECRET_KEY: ${{ secrets.MY_APP_SECRET }}
+                networks:
+                  - app-network
+                depends_on:
+                  - mongo
+              mongo:
+                image: mongo:latest
+                volumes:
+                  - mongo-data-prod:/data/db
+                networks:
+                  - app-network
+            networks:
+              app-network:
+                driver: bridge
+            volumes:
+              mongo-data-prod:
+                driver: local
+            " > docker-compose.yml
+
+            # Login a Docker Hub en el servidor (puede requerir instalar docker si no está)
+            echo ${{ secrets.DOCKERHUB_TOKEN }} | docker login -u ${{ secrets.DOCKERHUB_USERNAME }} --password-stdin
+
+            # Bajar las imágenes más recientes especificadas en el compose
+            docker-compose pull
+
+            # Levantar los servicios con las nuevas imágenes, eliminando contenedores viejos
+            # '--remove-orphans' elimina contenedores de servicios que ya no están en el compose
+            docker-compose up -d --remove-orphans
+
+            # (Opcional) Limpiar imágenes de Docker no utilizadas
+            docker image prune -af
