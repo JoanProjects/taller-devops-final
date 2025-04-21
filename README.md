@@ -8,7 +8,7 @@
 
 ## Equipo
 
-*   [Joan Arroyo]
+*   Joan Arroyo
 
 ## 1. Resumen del Proyecto
 
